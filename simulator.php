@@ -160,10 +160,44 @@ function buildTypesFromSoap(InlineSoapClient $client): array {
 }
 
 function parseFunctionSignature(string $function): array {
-    $name = strstr(substr($function, strpos($function, ' ') + 1), '(', true);
-    $responseType = strstr($function, ' ', true);
-    $requestType = strstr(trim(strstr($function, '('), '()'), ' ', true);
-    return ['name' => $name, 'requestType' => $requestType, 'responseType' => $responseType];
+    // Examples from __getFunctions():
+    // 1) "SomeResponse getSiteLogs(getSiteLogs $parameters)"  (wrapper type)
+    // 2) "string getSiteLogs(string site, int limit)"         (inline params)
+    $function = trim($function);
+    $responseType = trim(strstr($function, ' ', true));
+    $afterFirstSpace = trim(substr($function, strpos($function, ' ') + 1));
+    $name = strstr($afterFirstSpace, '(', true);
+    $paramsStr = trim($afterFirstSpace);
+    $paramsStr = substr($paramsStr, strpos($paramsStr, '(') + 1);
+    $paramsStr = rtrim($paramsStr, ')');
+    $params = [];
+    $inline = false;
+    $requestType = null;
+    if ($paramsStr !== '' && $paramsStr !== 'void') {
+        // Split by commas not in generics (simple split is fine here)
+        $parts = array_filter(array_map('trim', explode(',', $paramsStr)), fn($p)=> $p !== '');
+        // If exactly one part like "Type $parameters" then it's a wrapper
+        if (count($parts) === 1 && preg_match('/^([\\\w\[\]]+)\s+\$\w+$/', $parts[0], $m)) {
+            $requestType = $m[1];
+            $inline = false;
+        } else {
+            // Inline params: e.g., "string site, int limit"
+            foreach ($parts as $p) {
+                if (preg_match('/^([\\\w\[\]]+)\s+\$?(\w+)$/', $p, $m)) {
+                    $params[] = ['type' => $m[1], 'name' => $m[2]];
+                }
+            }
+            $inline = true;
+            $requestType = null; // will be synthesized
+        }
+    }
+    return [
+        'name' => $name,
+        'requestType' => $requestType,
+        'responseType' => $responseType,
+        'params' => $params,
+        'inline' => $inline,
+    ];
 }
 
 function buildOpenApiFromWsdl(InlineSoapClient $client, string $serviceName = 'soap'): array {
@@ -180,31 +214,8 @@ function buildOpenApiFromWsdl(InlineSoapClient $client, string $serviceName = 's
 
     $types = buildTypesFromSoap($client);
     $functions = $client->__getFunctions();
-    foreach ($functions as $fn) {
-        $schema = parseFunctionSignature($fn);
-        $paths['/' . $schema['name']] = [
-            'post' => [
-                'summary' => 'call the ' . $schema['name'] . ' operation.',
-                'description' => '',
-                'operationId' => 'call' . ucfirst($serviceName) . $schema['name'],
-                'requestBody' => [ '$ref' => '#/components/requestBodies/' . $schema['requestType'] ],
-                'responses' => [ '200' => ['$ref' => '#/components/responses/' . $schema['responseType']] ]
-            ]
-        ];
-    }
-
+    // We will collect requestBodies and schemas as we go, to handle inline params
     $requests = [];
-    foreach ($functions as $fn) {
-        $schema = parseFunctionSignature($fn);
-        $requests[$schema['requestType']] = [
-            'description' => $schema['requestType'] . ' Request',
-            'content' => [
-                'application/json' => [ 'schema' => ['$ref' => '#/components/schemas/' . $schema['requestType']] ],
-                'application/xml' => [ 'schema' => ['$ref' => '#/components/schemas/' . $schema['requestType']] ],
-            ]
-        ];
-    }
-
     $responses = [
         'SoapResponse' => [
             'description' => 'SOAP Response',
@@ -214,23 +225,72 @@ function buildOpenApiFromWsdl(InlineSoapClient $client, string $serviceName = 's
             ]
         ]
     ];
-    foreach ($functions as $fn) {
-        $schema = parseFunctionSignature($fn);
-        $responses[$schema['responseType']] = [
-            'description' => $schema['responseType'] . ' Response',
-            'content' => [
-                'application/json' => [ 'schema' => ['$ref' => '#/components/schemas/' . $schema['responseType']] ],
-                'application/xml' => [ 'schema' => ['$ref' => '#/components/schemas/' . $schema['responseType']] ],
-            ]
-        ];
-    }
-
     $schemas = array_merge([
         'SoapResponse' => [
             'type' => 'object',
             'properties' => [ 'resource' => [ 'type' => 'array', 'items' => ['type' => 'object'] ]]
         ]
     ], $types);
+
+    foreach ($functions as $fn) {
+        $schema = parseFunctionSignature($fn);
+        // Build/ensure request body component
+        $requestBodyRef = null;
+        if ($schema['inline']) {
+            // Synthesize a schema for inline parameters
+            $reqName = $schema['name'] . 'Request';
+            if (!isset($schemas[$reqName])) {
+                $props = [];
+                foreach ($schema['params'] as $p) {
+                    $t = $p['type'];
+                    if (array_key_exists($t, $types)) {
+                        $props[$p['name']] = ['$ref' => '#/components/schemas/' . $t];
+                    } else {
+                        $props[$p['name']] = soapTypeToSchema($t);
+                    }
+                }
+                $schemas[$reqName] = [ 'type' => 'object', 'properties' => $props ];
+            }
+            $requests[$reqName] = [
+                'description' => $reqName . ' Request',
+                'content' => [
+                    'application/json' => [ 'schema' => ['$ref' => '#/components/schemas/' . $reqName] ],
+                    'application/xml' => [ 'schema' => ['$ref' => '#/components/schemas/' . $reqName] ],
+                ]
+            ];
+            $requestBodyRef = '#/components/requestBodies/' . $reqName;
+        } else {
+            // Wrapper request type provided by WSDL/types
+            $reqType = $schema['requestType'];
+            $requests[$reqType] = [
+                'description' => $reqType . ' Request',
+                'content' => [
+                    'application/json' => [ 'schema' => ['$ref' => '#/components/schemas/' . $reqType] ],
+                    'application/xml' => [ 'schema' => ['$ref' => '#/components/schemas/' . $reqType] ],
+                ]
+            ];
+            $requestBodyRef = '#/components/requestBodies/' . $reqType;
+        }
+        // Response mapping
+        $respType = $schema['responseType'];
+        $responses[$respType] = [
+            'description' => $respType . ' Response',
+            'content' => [
+                'application/json' => [ 'schema' => ['$ref' => '#/components/schemas/' . $respType] ],
+                'application/xml' => [ 'schema' => ['$ref' => '#/components/schemas/' . $respType] ],
+            ]
+        ];
+        // Path item
+        $paths['/' . $schema['name']] = [
+            'post' => [
+                'summary' => 'call the ' . $schema['name'] . ' operation.',
+                'description' => '',
+                'operationId' => 'call' . ucfirst($serviceName) . $schema['name'],
+                'requestBody' => [ '$ref' => $requestBodyRef ],
+                'responses' => [ '200' => ['$ref' => '#/components/responses/' . $respType] ]
+            ]
+        ];
+    }
 
     return [
         'openapi' => '3.0.3',
@@ -336,6 +396,20 @@ if ($wsdl) {
             try { $last['request_headers'] = (string)$client->__getLastRequestHeaders(); } catch (Throwable $e) {}
             try { $last['response'] = (string)$client->__getLastResponse(); } catch (Throwable $e) {}
             try { $last['response_headers'] = (string)$client->__getLastResponseHeaders(); } catch (Throwable $e) {}
+
+            // If this is an AJAX/fetch request asking for JSON, return data instead of redirecting
+            $accept = $_SERVER['HTTP_ACCEPT'] ?? '';
+            $xrw = $_SERVER['HTTP_X_REQUESTED_WITH'] ?? '';
+            if (stripos($accept, 'application/json') !== false || strtolower($xrw) === 'fetch' || strtolower($xrw) === 'xmlhttprequest') {
+                header('Content-Type: application/json');
+                echo json_encode([
+                    'ok'      => empty($errors),
+                    'errors'  => $errors,
+                    'last'    => $last,
+                    'result'  => $result,
+                ], JSON_UNESCAPED_SLASHES);
+                exit;
+            }
 
             // Post/Redirect/Get to prevent browser resubmission warning on refresh
             if ($method === 'POST') {
@@ -596,6 +670,20 @@ header('Content-Type: text/html; charset=UTF-8');
       .tok-ret { color:#fdba74; background:#451a03; border-color:#7c2d12; }
       .tok-param { color:#93c5fd; background:#0a172a; border-color:#1e3a8a; }
       .tok-sig { color:#9aa4ae; }
+      /* Swagger UI dark overrides */
+      #swagger-ui { color: #e6edf3; }
+      #swagger-ui .topbar { background: #0b0f14; border-bottom: 1px solid #30363d; }
+      #swagger-ui .info, #swagger-ui .scheme-container, #swagger-ui .opblock, #swagger-ui .model-box, #swagger-ui .opblock-tag { background: #0f1722; color:#e6edf3; border-color:#30363d; }
+      #swagger-ui .opblock { border: 1px solid #30363d; }
+      #swagger-ui .opblock .opblock-summary { background:#0b0f14; border-color:#30363d; }
+      #swagger-ui .opblock .opblock-summary-method { background:#1f6feb; color:#fff; }
+      #swagger-ui .opblock-description-wrapper, #swagger-ui .responses-inner, #swagger-ui .parameters, #swagger-ui .opblock-section-header { background:#0f1722; border-color:#30363d; }
+      #swagger-ui .response-col_description__inner, #swagger-ui .model, #swagger-ui table thead tr th, #swagger-ui table tbody tr td { color:#e6edf3; border-color:#30363d; }
+      #swagger-ui .btn, #swagger-ui .btn:hover { background:#1f6feb; color:#fff; border-color:#1f6feb; }
+      #swagger-ui .model-title, #swagger-ui .prop-format, #swagger-ui .prop-type { color:#9aa4ae; }
+      #swagger-ui .copy-to-clipboard { background:#0b0f14; color:#e6edf3; border-color:#30363d; }
+      #swagger-ui .markdown code, #swagger-ui code { background:#0d1117; color:#c9d1d9; }
+      #swagger-ui .tab li { color:#e6edf3; }
     }
   </style>
   <script>
@@ -668,7 +756,7 @@ header('Content-Type: text/html; charset=UTF-8');
   </div>
 
   <div id="panel-builder" class="tab-panel">
-  <form method="post" onsubmit="(function(){
+  <form id="invoke_form" method="post" onsubmit="(function(){
       const xmlEd = window.__xmlEditor; const xmlTa = document.getElementById('override_xml_textarea');
       if (xmlEd && xmlTa) xmlTa.value = xmlEd.getValue();
     })();">
@@ -748,7 +836,8 @@ header('Content-Type: text/html; charset=UTF-8');
     <textarea id="override_xml_textarea" name="override_request_xml" hidden><?= h($overrideXml) ?></textarea>
 
     <div class="actions">
-      <button type="submit">Invoke</button>
+      <button id="btn_invoke" type="submit">Invoke</button>
+      <span id="invoke_status" class="muted"></span>
     </div>
   </form>
 
@@ -957,6 +1046,67 @@ header('Content-Type: text/html; charset=UTF-8');
       }
     }
   })();
+
+  // Intercept Invoke submit to perform partial refresh via fetch
+  window.addEventListener('DOMContentLoaded', function(){
+    const form = document.getElementById('invoke_form');
+    if (!form) return;
+    form.addEventListener('submit', function(ev){
+      try { ev.preventDefault(); } catch(_) {}
+      // Ensure override XML textarea is synced (inline onsubmit already does this)
+      const btn = document.getElementById('btn_invoke');
+      const statusEl = document.getElementById('invoke_status');
+      if (btn){ btn.disabled = true; btn.textContent = 'Invoking...'; }
+      if (statusEl){ statusEl.textContent = ''; }
+      // Build FormData
+      const fd = new FormData(form);
+      // Keep payload editor in sync
+      try {
+        const ta = document.getElementById('payload_area');
+        if (window.__payloadEditor && ta){
+          const v = window.__payloadEditor.getValue();
+          ta.value = v;
+          fd.set('payload', v);
+        }
+      } catch(_) {}
+      // Ensure action
+      if (!fd.get('action')) fd.set('action','call');
+      const targetUrl = window.__SIM_SRC__ || (window.location && window.location.pathname) || window.location.href;
+      fetch(targetUrl, {
+        method: 'POST',
+        body: fd,
+        headers: { 'Accept': 'application/json', 'X-Requested-With': 'fetch' }
+      })
+      .then(r=>{
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const ct = r.headers.get('content-type')||'';
+        if (!ct.includes('application/json')) return r.text().then(t=>{ throw new Error('Non-JSON response: '+t.slice(0,200)); });
+        return r.json();
+      })
+      .then(j=>{
+        const last = (j && j.last) || {};
+        const result = (j && j.result) || null;
+        // Update frames
+        const setText = (id, val)=>{ const el = document.getElementById(id); if (el){ el.textContent = val || ''; } };
+        setText('req_headers_pre', last.request_headers || '');
+        setText('resp_headers_pre', last.response_headers || '');
+        setText('resp_xml_pre', last.response || '');
+        setText('parsed_result_pre', (result!=null ? JSON.stringify(result, null, 2) : 'null'));
+        // cache last response for copy
+        window.__lastResponse = last.response || '';
+        // pretty/rehighlight
+        try { if (typeof formatAndHighlight === 'function') formatAndHighlight(); } catch(_) {}
+        if (statusEl){ statusEl.textContent = (j && j.ok) ? 'Done' : 'Completed with errors'; }
+      })
+      .catch(err=>{
+        console.error('[Invoke]', err);
+        if (statusEl){ statusEl.textContent = 'Invoke error – see console'; }
+      })
+      .finally(()=>{
+        if (btn){ btn.disabled = false; btn.textContent = 'Invoke'; }
+      });
+    });
+  });
 
   // Initialize ACE editor for XML override
   (function(){

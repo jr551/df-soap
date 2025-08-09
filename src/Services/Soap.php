@@ -286,29 +286,7 @@ class Soap extends BaseRestService
                                 $fieldType = $newType;
                             }
                         }
-                        // Build base object schema
-                        $objSchema = ['type' => 'object', 'properties' => $type];
-                        // Augment with oneOf based on xs:choice from WSDL if available
-                        try {
-                            $choiceElements = $this->getChoiceElements($name);
-                            if (!empty($choiceElements)) {
-                                $oneOf = [];
-                                foreach ($choiceElements as $elName) {
-                                    $oneOf[] = ['required' => [$elName]];
-                                }
-                                // Only add oneOf when we have 2 or more choices
-                                if (count($oneOf) >= 2) {
-                                    $objSchema['oneOf'] = $oneOf;
-                                    $msg = 'Exactly one of [' . implode(', ', $choiceElements) . '] must be provided.';
-                                    $objSchema['description'] = isset($objSchema['description']) && is_string($objSchema['description'])
-                                        ? trim($objSchema['description'] . ' ' . $msg)
-                                        : $msg;
-                                }
-                            }
-                        } catch (\Throwable $e) {
-                            // If DOM parse fails, continue without oneOf
-                        }
-                        $type = $objSchema;
+                        $type = ['type' => 'object', 'properties' => $type];
                     }
                 } else {
                     if (array_key_exists($type, $structures)) {
@@ -683,79 +661,6 @@ class Soap extends BaseRestService
         ];
 
         return array_merge($models, $this->getTypes());
-    }
-
-    /**
-     * Lazily load and return the DOMDocument for the configured WSDL.
-     *
-     * @return \DOMDocument|null
-     */
-    protected function getDom()
-    {
-        if ($this->dom instanceof \DOMDocument) {
-            return $this->dom;
-        }
-        if (empty($this->wsdl)) {
-            return null;
-        }
-        $dom = new \DOMDocument();
-        // Suppress warnings from invalid markup but do not throw
-        try {
-            // Load may accept file path or URL
-            if (@$dom->load($this->wsdl)) {
-                $this->dom = $dom;
-                return $this->dom;
-            }
-        } catch (\Throwable $e) {
-            // ignore
-        }
-        return null;
-    }
-
-    /**
-     * Extract element names that are part of an xs:choice group inside the given complexType.
-     * Returns a flat array of element local names. If multiple choice groups exist, they are
-     * merged, as OpenAPI oneOf can still express mutual exclusivity across the union.
-     *
-     * @param string $typeName
-     * @return array
-     */
-    protected function getChoiceElements(string $typeName): array
-    {
-        $dom = $this->getDom();
-        if (!$dom) {
-            return [];
-        }
-        $xp = new \DOMXPath($dom);
-        // Register likely namespaces used in WSDL/XSD
-        $xp->registerNamespace('wsdl', 'http://schemas.xmlsoap.org/wsdl/');
-        $xp->registerNamespace('xs', 'http://www.w3.org/2001/XMLSchema');
-        $xp->registerNamespace('xsd', 'http://www.w3.org/2001/XMLSchema');
-
-        // Find xs:complexType[@name=typeName] and any nested xs:choice/xs:element
-        $query = sprintf(
-            "//xs:complexType[@name='%s']//xs:choice/xs:element",
-            addslashes($typeName)
-        );
-        $nodes = $xp->query($query);
-        if (!$nodes || $nodes->length === 0) {
-            return [];
-        }
-        $names = [];
-        foreach ($nodes as $n) {
-            /** @var \DOMElement $n */
-            $nameAttr = $n->getAttribute('name');
-            if (!$nameAttr && $n->hasAttribute('ref')) {
-                // ref like ns:ElementName
-                $ref = $n->getAttribute('ref');
-                $parts = explode(':', $ref);
-                $nameAttr = end($parts) ?: $ref;
-            }
-            if ($nameAttr) {
-                $names[$nameAttr] = true;
-            }
-        }
-        return array_keys($names);
     }
 
     protected static function soapType2ApiDocType($name)
