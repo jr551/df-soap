@@ -27,6 +27,12 @@
     "issues": "https://github.com/dreamfactorysoftware/df-soap/issues",
     "wiki":   "https://wiki.dreamfactory.com"
   },
+  "repositories": [
+    {
+      "type": "vcs",
+      "url": "git@github.com:dreamfactorysoftware/df-core.git"
+    }
+  ],
   "prefer-stable": true,
   "require":           {
     "php": "^8.0",
