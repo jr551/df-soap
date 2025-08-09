@@ -36,6 +36,10 @@ class FunctionSchema
      */
     public $requestFields;
     /**
+     * @var array Associative array of parameters parsed from the function signature: [name => type]
+     */
+    public $params = [];
+    /**
      * @var string Response object type.
      */
     public $responseType;
@@ -46,9 +50,29 @@ class FunctionSchema
 
     public function __construct($function)
     {
+        // Example signature from SoapClient: "ResponseType FunctionName(ParamType1 param1, ParamType2 param2)"
         $this->name = strstr(substr($function, strpos($function, ' ') + 1), '(', true);
         $this->responseType = strstr($function, ' ', true);
-        $this->requestType = strstr(trim(strstr($function, '('), '()'), ' ', true);
+        $inside = trim(strstr($function, '('), '()');
+        // Set requestType to the first token for backward compatibility (document/literal wrapper case)
+        $this->requestType = strstr($inside, ' ', true);
+        // Parse all parameters into $this->params
+        $this->params = [];
+        if ($inside !== '' && strtolower($inside) !== 'void') {
+            foreach (explode(',', $inside) as $raw) {
+                $seg = trim($raw);
+                if ($seg === '') continue;
+                // Expect "Type name"; reduce multiple spaces
+                $seg = preg_replace('/\s+/', ' ', $seg);
+                $parts = explode(' ', $seg);
+                if (count($parts) >= 2) {
+                    $name = $parts[count($parts)-1];
+                    $type = implode(' ', array_slice($parts, 0, -1));
+                    $name = ltrim($name, '$');
+                    $this->params[$name] = $type;
+                }
+            }
+        }
     }
 
     public function fill(array $settings)
